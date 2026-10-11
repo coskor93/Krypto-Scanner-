@@ -6,6 +6,7 @@ import time
 from io import StringIO
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -25,6 +26,12 @@ MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
 ATR_STOP = 1.5       # Stop-Loss = 1.5 x ATR
 ATR_TARGET = 3.0     # Ziel = 3 x ATR (CRV 1:2)
 STATE_FILE = Path("state.json")
+# --- Preisstruktur-Filter ---
+USE_SR = True          # Unterstützung/Widerstand berücksichtigen
+SR_LOOKBACK = 50       # Hoch/Tief der letzten 50 Kerzen = Widerstand/Unterstützung
+SR_NEAR_ATR = 1.0      # "nah" = innerhalb von 1 x ATR
+USE_CANDLES = True     # Kerzenmuster (Hammer, Shooting Star, Engulfing) als Zusatzpunkt
+BTC_FILTER = True      # Krypto-LONGs nur, wenn Bitcoin nicht im Abwärtstrend ist
 # -----------------------------------
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -51,6 +58,22 @@ def add_indicators(df):
                     (df["Low"] - c.shift()).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
     df["vol_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
+
+    # Unterstützung / Widerstand: Hoch/Tief der letzten Kerzen (ohne die aktuelle)
+    df["res"] = df["High"].shift(1).rolling(SR_LOOKBACK).max()
+    df["sup"] = df["Low"].shift(1).rolling(SR_LOOKBACK).min()
+
+    # Kerzenmuster
+    o, h, l = df["Open"], df["High"], df["Low"]
+    body, rng = (c - o).abs(), h - l
+    lower = pd.concat([o, c], axis=1).min(axis=1) - l
+    upper = h - pd.concat([o, c], axis=1).max(axis=1)
+    hammer = (rng > 0) & (lower >= 2 * body) & (upper <= 0.3 * rng)
+    star = (rng > 0) & (upper >= 2 * body) & (lower <= 0.3 * rng)
+    bull_eng = (c.shift() < o.shift()) & (c > o) & (o <= c.shift()) & (c >= o.shift())
+    bear_eng = (c.shift() > o.shift()) & (c < o) & (o >= c.shift()) & (c <= o.shift())
+    df["pat_bull"] = np.select([bull_eng, hammer], ["Bullish Engulfing", "Hammer"], "")
+    df["pat_bear"] = np.select([bear_eng, star], ["Bearish Engulfing", "Shooting Star"], "")
     return df
 
 
@@ -93,11 +116,34 @@ def signal_from_rows(r, p, candle):
         if vol_ok and trigger:
             score += 1; why.append(f"Volumen {r.vol_ratio:.1f}x über Schnitt")
 
-        if trigger and score >= MIN_SCORE:
-            price, atr = float(r.Close), float(r.atr)
+        if not trigger:
+            continue
+        price, atr = float(r.Close), float(r.atr)
+
+        if USE_SR and pd.notna(r.res) and pd.notna(r.sup) and atr > 0:
+            near = SR_NEAR_ATR * atr
+            if long:
+                if 0 < r.res - price < near:
+                    continue                      # Widerstand direkt über dem Kurs
+                if 0 <= price - r.sup <= near:
+                    score += 1; why.append("Nähe zur Unterstützung")
+            else:
+                if 0 < price - r.sup < near:
+                    continue                      # Unterstützung direkt unter dem Kurs
+                if 0 <= r.res - price <= near:
+                    score += 1; why.append("Nähe zum Widerstand")
+
+        if USE_CANDLES:
+            pat = r.pat_bull if long else r.pat_bear
+            if pat:
+                score += 1; why.append(f"Kerzenmuster: {pat}")
+
+        if score >= MIN_SCORE:
             sign = 1 if long else -1
             return {
                 "side": side, "score": score, "why": why, "price": price,
+                "res": float(r.res) if pd.notna(r.res) else None,
+                "sup": float(r.sup) if pd.notna(r.sup) else None,
                 "stop": price - sign * ATR_STOP * atr,
                 "target": price + sign * ATR_TARGET * atr,
                 "candle": candle,
@@ -235,7 +281,10 @@ def fmt(sym, sig, tf):
             f"Score: {sig['score']}\n"
             f"Preis: {p:.{d}f} {cur}\n"
             f"Stop-Loss: {sig['stop']:.{d}f} {cur}\n"
-            f"Ziel: {sig['target']:.{d}f} {cur}\n\n"
+            f"Ziel: {sig['target']:.{d}f} {cur}\n"
+            + (f"Widerstand: {sig['res']:.{d}f} {cur} | Unterstützung: {sig['sup']:.{d}f} {cur}\n"
+               if sig.get("res") and sig.get("sup") else "")
+            + "\n"
             + "\n".join("• " + w for w in sig["why"])
             + "\n\n⚠️ Keine Anlageberatung.")
 
@@ -256,6 +305,15 @@ def main():
         total = len(stocks) if kind == "stocks" else len(crypto)
         print(f"[{kind} {tf}] Daten für {len(data)} von {total} Symbolen erhalten")
 
+        btc_down = False
+        if kind == "crypto" and BTC_FILTER and "BTC-EUR" in data:
+            try:
+                b = add_indicators(data["BTC-EUR"].copy()).iloc[-2]
+                btc_down = bool(b.Close < b.ema200 and b.ema50 < b.ema200)
+                print(f"BTC-Trend ({tf}): {'Abwärtstrend, Altcoin-LONGs gefiltert' if btc_down else 'kein Abwärtstrend'}")
+            except Exception as e:
+                print("BTC-Filter nicht berechenbar:", e)
+
         for sym, df in data.items():
             try:
                 sig = evaluate(add_indicators(df))
@@ -265,6 +323,8 @@ def main():
                 continue
             is_crypto = sym.endswith("-EUR")
             if sig["side"] == "SHORT" and not (SHORTS_CRYPTO if is_crypto else SHORTS_STOCKS):
+                continue
+            if btc_down and sig["side"] == "LONG" and sym != "BTC-EUR":
                 continue
             if state.get(f"{sym}|{tf}") == f"{sig['side']}@{sig['candle']}":
                 continue
