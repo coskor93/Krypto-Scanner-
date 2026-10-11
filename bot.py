@@ -18,7 +18,7 @@ SHORTS_STOCKS = True   # True = bei Aktien auch SHORT-Signale senden
 SHORTS_CRYPTO = True    # True = bei Krypto auch SHORT-/Verkaufs-Signale senden
 MAX_SIGNALS = 10     # maximal so viele Nachrichten pro Lauf (beste Scores zuerst)
 FALLBACK_STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO"]
-INTERVAL = "1h"      # Kerzen: 15m, 30m, 1h, 1d
+TIMEFRAMES = ["1h", "15m"]   # Zeitebenen, die gescannt werden (z. B. "15m", "30m", "1h", "1d")
 PERIOD = "60d"       # genug Historie für EMA200
 MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
 ATR_STOP = 1.5       # Stop-Loss = 1.5 x ATR
@@ -158,12 +158,12 @@ def get_top_crypto():
     return out
 
 
-def fetch_bitvavo(markets):
+def fetch_bitvavo(markets, interval):
     """Holt 1h-Kerzen direkt von Bitvavo (öffentliche API, kein Key nötig)."""
     out = {}
     for mk in markets:
         try:
-            params = {"interval": INTERVAL, "limit": 500}
+            params = {"interval": interval, "limit": 500}
             r = requests.get(f"{BITVAVO}/{mk}/candles", params=params, timeout=20)
             if r.status_code == 429:
                 time.sleep(15)
@@ -182,13 +182,13 @@ def fetch_bitvavo(markets):
     return out
 
 
-def download(symbols, chunk_size=50):
+def download(symbols, interval, chunk_size=50):
     """Lädt Kerzen in Blöcken (viel schneller als einzeln). Gibt {symbol: DataFrame} zurück."""
     out = {}
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
         try:
-            data = yf.download(chunk, period=PERIOD, interval=INTERVAL, group_by="ticker",
+            data = yf.download(chunk, period=PERIOD, interval=interval, group_by="ticker",
                                threads=True, progress=False, auto_adjust=False)
         except Exception as e:
             print("Download-Fehler:", e); continue
@@ -218,14 +218,15 @@ def send(text):
         print("Telegram-Fehler:", resp.text)
 
 
-def fmt(sym, sig):
+def fmt(sym, sig, tf):
     icon = "🟢" if sig["side"] == "LONG" else "🔴"
     crypto = sym.endswith("-EUR")
     kind = "Krypto (Bitvavo)" if crypto else "Aktie"
     cur = "€" if sym.endswith(("-EUR", ".DE")) else "$"
     p = sig["price"]
     d = 2 if p >= 10 else 4 if p >= 0.1 else 6
-    return (f"{icon} {sig['side']}-Signal: {sym} ({kind}, {INTERVAL})\n"
+    return (f"{icon} {sig['side']}-Signal: {sym}\n"
+            f"⏱ Zeitebene: {tf}  |  {kind}\n"
             f"Score: {sig['score']}\n"
             f"Preis: {p:.{d}f} {cur}\n"
             f"Stop-Loss: {sig['stop']:.{d}f} {cur}\n"
@@ -242,32 +243,34 @@ def main():
 
     stocks = list(dict.fromkeys(get_sp500() + EXTRA_STOCKS))
     crypto = get_top_crypto()
-    data = {}
-    data.update(download(stocks))
-    data.update(fetch_bitvavo(crypto))
-    print(f"Daten für {len(data)} von {len(stocks) + len(crypto)} Symbolen erhalten")
 
     found = []
-    for sym, df in data.items():
-        try:
-            sig = evaluate(add_indicators(df))
-        except Exception as e:
-            print(sym, "Fehler:", e); continue
-        if not sig:
-            continue
-        is_crypto = sym.endswith("-EUR")
-        if sig["side"] == "SHORT" and not (SHORTS_CRYPTO if is_crypto else SHORTS_STOCKS):
-            continue
-        if state.get(sym) == f"{sig['side']}@{sig['candle']}":
-            continue
-        found.append((sym, sig))
+    for tf in TIMEFRAMES:
+        data = {}
+        data.update(download(stocks, tf))
+        data.update(fetch_bitvavo(crypto, tf))
+        print(f"[{tf}] Daten für {len(data)} von {len(stocks) + len(crypto)} Symbolen erhalten")
 
-    found.sort(key=lambda x: x[1]["score"], reverse=True)
+        for sym, df in data.items():
+            try:
+                sig = evaluate(add_indicators(df))
+            except Exception as e:
+                print(sym, tf, "Fehler:", e); continue
+            if not sig:
+                continue
+            is_crypto = sym.endswith("-EUR")
+            if sig["side"] == "SHORT" and not (SHORTS_CRYPTO if is_crypto else SHORTS_STOCKS):
+                continue
+            if state.get(f"{sym}|{tf}") == f"{sig['side']}@{sig['candle']}":
+                continue
+            found.append((sym, tf, sig))
+
+    found.sort(key=lambda x: x[2]["score"], reverse=True)
     print(f"{len(found)} neue Signale, sende die besten {min(len(found), MAX_SIGNALS)}")
-    for sym, sig in found[:MAX_SIGNALS]:
-        send(fmt(sym, sig))
-        state[sym] = f"{sig['side']}@{sig['candle']}"
-        print("Signal:", sym, sig["side"], sig["score"])
+    for sym, tf, sig in found[:MAX_SIGNALS]:
+        send(fmt(sym, sig, tf))
+        state[f"{sym}|{tf}"] = f"{sig['side']}@{sig['candle']}"
+        print("Signal:", sym, tf, sig["side"], sig["score"])
     STATE_FILE.write_text(json.dumps(state, indent=1))
 
 
