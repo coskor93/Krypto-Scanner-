@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -9,8 +10,12 @@ import requests
 import yfinance as yf
 
 # ---------- Einstellungen ----------
-STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO", "PLTR", "COIN", "JPM", "V", "DIS", "UBER", "INTC", "BABA", "SAP.DE", "SIE.DE", "ALV.DE", "BMW.DE", "RHM.DE", "MBG.DE"]
-CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "TRX-USD", "SHIB-USD", "NEAR-USD", "ATOM-USD"]
+EXTRA_STOCKS = ["SAP.DE", "SIE.DE", "ALV.DE", "RHM.DE"]   # zusätzlich zum S&P 500
+CRYPTO_TOP_N = 50    # Top-N Kryptos nach Marktkapitalisierung (CoinGecko)
+MAX_SIGNALS = 10     # maximal so viele Nachrichten pro Lauf (beste Scores zuerst)
+FALLBACK_STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO"]
+FALLBACK_CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD",
+                   "ADA-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "TRX-USD"]
 INTERVAL = "1h"      # Kerzen: 15m, 30m, 1h, 1d
 PERIOD = "60d"       # genug Historie für EMA200
 MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
@@ -93,6 +98,70 @@ def evaluate(df):
     return None
 
 
+def get_sp500():
+    try:
+        r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                         headers={"User-Agent": "Mozilla/5.0 signalbot"}, timeout=30)
+        r.raise_for_status()
+        tab = pd.read_html(StringIO(r.text))[0]
+        syms = [x.replace(".", "-") for x in tab["Symbol"].astype(str)]
+        print(f"S&P 500: {len(syms)} Symbole geladen")
+        return syms
+    except Exception as e:
+        print("S&P-500-Liste nicht ladbar, nutze Fallback:", e)
+        return FALLBACK_STOCKS
+
+
+STABLE = {"USDT", "USDC", "DAI", "USDE", "FDUSD", "TUSD", "USDS", "PYUSD", "USD1", "USDD", "BUIDL", "USDTB"}
+
+
+def get_top_crypto():
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
+                         params={"vs_currency": "usd", "order": "market_cap_desc",
+                                 "per_page": 100, "page": 1}, timeout=30)
+        r.raise_for_status()
+        out = []
+        for c in r.json():
+            sym, name = c["symbol"].upper(), c["name"].lower()
+            if sym in STABLE or any(w in name for w in ("wrapped", "staked", "bridged", "usd", "stable")):
+                continue
+            out.append(f"{sym}-USD")
+            if len(out) >= CRYPTO_TOP_N:
+                break
+        print(f"Krypto: {len(out)} Symbole geladen")
+        return out
+    except Exception as e:
+        print("Krypto-Liste nicht ladbar, nutze Fallback:", e)
+        return FALLBACK_CRYPTO
+
+
+def download(symbols, chunk_size=50):
+    """Lädt Kerzen in Blöcken (viel schneller als einzeln). Gibt {symbol: DataFrame} zurück."""
+    out = {}
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        try:
+            data = yf.download(chunk, period=PERIOD, interval=INTERVAL, group_by="ticker",
+                               threads=True, progress=False, auto_adjust=False)
+        except Exception as e:
+            print("Download-Fehler:", e); continue
+        for sym in chunk:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    if sym not in data.columns.get_level_values(0):
+                        continue
+                    df = data[sym]
+                else:
+                    df = data
+                df = df.dropna(subset=["Close"])
+                if not df.empty:
+                    out[sym] = df
+            except Exception:
+                continue
+    return out
+
+
 def send(text):
     if not TOKEN or not CHAT_ID:
         print("[Kein Telegram-Token gesetzt] " + text)
@@ -105,7 +174,7 @@ def send(text):
 
 def fmt(sym, sig):
     icon = "🟢" if sig["side"] == "LONG" else "🔴"
-    kind = "Krypto" if sym in CRYPTO else "Aktie"
+    kind = "Krypto" if sym.endswith("-USD") else "Aktie"
     d = 4 if sig["price"] < 10 else 2
     return (f"{icon} {sig['side']}-Signal: {sym} ({kind}, {INTERVAL})\n"
             f"Score: {sig['score']}\n"
@@ -121,21 +190,32 @@ def main():
         send("✅ Signalbot läuft und ist mit Telegram verbunden.")
         return
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    for sym in STOCKS + CRYPTO:
+
+    stocks = list(dict.fromkeys(get_sp500() + EXTRA_STOCKS))
+    crypto = get_top_crypto()
+    data = {}
+    data.update(download(stocks))
+    data.update(download(crypto))
+    print(f"Daten für {len(data)} von {len(stocks) + len(crypto)} Symbolen erhalten")
+
+    found = []
+    for sym, df in data.items():
         try:
-            df = yf.Ticker(sym).history(period=PERIOD, interval=INTERVAL)
-            if df.empty:
-                print(sym, "keine Daten"); continue
             sig = evaluate(add_indicators(df))
         except Exception as e:
             print(sym, "Fehler:", e); continue
         if not sig:
-            print(sym, "kein Signal"); continue
-        key = f"{sig['side']}@{sig['candle']}"
-        if state.get(sym) == key:
-            print(sym, "bereits gesendet"); continue
+            continue
+        if state.get(sym) == f"{sig['side']}@{sig['candle']}":
+            continue
+        found.append((sym, sig))
+
+    found.sort(key=lambda x: x[1]["score"], reverse=True)
+    print(f"{len(found)} neue Signale, sende die besten {min(len(found), MAX_SIGNALS)}")
+    for sym, sig in found[:MAX_SIGNALS]:
         send(fmt(sym, sig))
-        state[sym] = key
+        state[sym] = f"{sig['side']}@{sig['candle']}"
+        print("Signal:", sym, sig["side"], sig["score"])
     STATE_FILE.write_text(json.dumps(state, indent=1))
 
 
