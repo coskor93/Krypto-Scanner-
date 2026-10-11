@@ -16,7 +16,7 @@ CRYPTO_TOP_N = 50    # Top-N Kryptos nach Marktkapitalisierung (CoinGecko)
 BITVAVO = "https://api.bitvavo.com/v2"   # Krypto-Kurse direkt von Bitvavo (EUR-Märkte)
 SHORTS_STOCKS = True   # True = bei Aktien auch SHORT-Signale senden
 SHORTS_CRYPTO = True    # True = bei Krypto auch SHORT-/Verkaufs-Signale senden
-MAX_SIGNALS = 10     # maximal so viele Nachrichten pro Lauf (beste Scores zuerst)
+MAX_SIGNALS = 15     # maximal so viele Nachrichten pro Lauf (beste Scores zuerst)
 FALLBACK_STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO"]
 TIMEFRAMES = ["1h", "15m"]   # Zeitebenen, die gescannt werden (z. B. "15m", "30m", "1h", "1d")
 PERIOD = "60d"       # genug Historie für EMA200
