@@ -113,6 +113,7 @@ def get_sp500():
 
 
 STABLE = {"USDT", "USDC", "DAI", "USDE", "FDUSD", "TUSD", "USDS", "PYUSD", "USD1", "USDD", "BUIDL", "USDTB"}
+YAHOO_FIX = {"PEPE": "PEPE24478", "SUI": "SUI20947", "UNI": "UNI7083", "TAO": "TAO22974", "HYPE": "HYPE32196"}
 
 
 def get_top_crypto():
@@ -126,7 +127,8 @@ def get_top_crypto():
             sym, name = c["symbol"].upper(), c["name"].lower()
             if sym in STABLE or any(w in name for w in ("wrapped", "staked", "bridged", "usd", "stable")):
                 continue
-            out.append(f"{sym}-USD")
+            out.append(f"{YAHOO_FIX.get(sym, sym)}-USD")
+
             if len(out) >= CRYPTO_TOP_N:
                 break
         print(f"Krypto: {len(out)} Symbole geladen")
