@@ -27,7 +27,7 @@ ATR_STOP = 1.5       # Stop-Loss = 1.5 x ATR
 ATR_TARGET = 3.0     # Ziel = 3 x ATR (CRV 1:2)
 STATE_FILE = Path("state.json")
 # --- Preisstruktur-Filter ---
-USE_SR = True          # Unterstützung/Widerstand berücksichtigen
+USE_SR = False          # Unterstützung/Widerstand berücksichtigen
 SR_LOOKBACK = 50       # Hoch/Tief der letzten 50 Kerzen = Widerstand/Unterstützung
 SR_NEAR_ATR = 1.0      # "nah" = innerhalb von 1 x ATR
 USE_CANDLES = True     # Kerzenmuster (Hammer, Shooting Star, Engulfing) als Zusatzpunkt
