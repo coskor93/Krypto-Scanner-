@@ -18,8 +18,9 @@ SHORTS_STOCKS = True   # True = bei Aktien auch SHORT-Signale senden
 SHORTS_CRYPTO = True    # True = bei Krypto auch SHORT-/Verkaufs-Signale senden
 MAX_SIGNALS = 15     # maximal so viele Nachrichten pro Lauf (beste Scores zuerst)
 FALLBACK_STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO"]
-TIMEFRAMES = ["1h", "15m"]   # Zeitebenen, die gescannt werden (z. B. "15m", "30m", "1h", "1d")
-PERIOD = "60d"       # genug Historie für EMA200
+STOCK_TF = ["1h", "1d"]    # Zeitebenen für Aktien (Yahoo: 15m, 30m, 1h, 1d)
+CRYPTO_TF = ["1h", "4h"]   # Zeitebenen für Krypto (Bitvavo: 15m, 30m, 1h, 4h, 1d)
+PERIODS = {"15m": "60d", "30m": "60d", "1h": "60d", "1d": "2y"}   # Historie für die Indikatoren (EMA200 braucht >210 Kerzen)
 MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
 ATR_STOP = 1.5       # Stop-Loss = 1.5 x ATR
 ATR_TARGET = 3.0     # Ziel = 3 x ATR (CRV 1:2)
@@ -57,8 +58,12 @@ def evaluate(df):
     """Bewertet die letzte ABGESCHLOSSENE Kerze. Gibt Signal-Dict oder None zurück."""
     if len(df) < 210:
         return None
-    r, p = df.iloc[-2], df.iloc[-3]
-    vol_ok = pd.notna(r["vol_ratio"]) and r["vol_ratio"] > 1.5
+    return signal_from_rows(df.iloc[-2], df.iloc[-3], str(df.index[-2]))
+
+
+def signal_from_rows(r, p, candle):
+    """Bewertet eine Kerze r (p = Vorgängerkerze). Wird auch vom Backtest genutzt."""
+    vol_ok = pd.notna(r.vol_ratio) and r.vol_ratio > 1.5
 
     for side in ("LONG", "SHORT"):
         long = side == "LONG"
@@ -95,7 +100,7 @@ def evaluate(df):
                 "side": side, "score": score, "why": why, "price": price,
                 "stop": price - sign * ATR_STOP * atr,
                 "target": price + sign * ATR_TARGET * atr,
-                "candle": str(df.index[-2]),
+                "candle": candle,
             }
     return None
 
@@ -182,13 +187,13 @@ def fetch_bitvavo(markets, interval):
     return out
 
 
-def download(symbols, interval, chunk_size=50):
+def download(symbols, interval, chunk_size=50, period=None):
     """Lädt Kerzen in Blöcken (viel schneller als einzeln). Gibt {symbol: DataFrame} zurück."""
     out = {}
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
         try:
-            data = yf.download(chunk, period=PERIOD, interval=interval, group_by="ticker",
+            data = yf.download(chunk, period=period or PERIODS.get(interval, "60d"), interval=interval, group_by="ticker",
                                threads=True, progress=False, auto_adjust=False)
         except Exception as e:
             print("Download-Fehler:", e); continue
@@ -245,11 +250,11 @@ def main():
     crypto = get_top_crypto()
 
     found = []
-    for tf in TIMEFRAMES:
-        data = {}
-        data.update(download(stocks, tf))
-        data.update(fetch_bitvavo(crypto, tf))
-        print(f"[{tf}] Daten für {len(data)} von {len(stocks) + len(crypto)} Symbolen erhalten")
+    jobs = [(tf, "stocks") for tf in STOCK_TF] + [(tf, "crypto") for tf in CRYPTO_TF]
+    for tf, kind in jobs:
+        data = download(stocks, tf) if kind == "stocks" else fetch_bitvavo(crypto, tf)
+        total = len(stocks) if kind == "stocks" else len(crypto)
+        print(f"[{kind} {tf}] Daten für {len(data)} von {total} Symbolen erhalten")
 
         for sym, df in data.items():
             try:
