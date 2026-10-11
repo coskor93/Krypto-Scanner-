@@ -9,8 +9,8 @@ import requests
 import yfinance as yf
 
 # ---------- Einstellungen ----------
-STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "SAP.DE"]
-CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
+STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO", "PLTR", "COIN", "JPM", "V", "DIS", "UBER", "INTC", "BABA", "SAP.DE", "SIE.DE", "ALV.DE", "BMW.DE", "RHM.DE", "MBG.DE"]
+CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "TRX-USD", "SHIB-USD", "NEAR-USD", "ATOM-USD"]
 INTERVAL = "1h"      # Kerzen: 15m, 30m, 1h, 1d
 PERIOD = "60d"       # genug Historie für EMA200
 MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
