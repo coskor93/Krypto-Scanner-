@@ -2,7 +2,7 @@ name: Signalbot
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # alle 15 Minuten (GitHub kann um einige Minuten verzögern)
+    - cron: "*/30 * * * *"   # alle 30 Minuten
   workflow_dispatch:         # manueller Start
     inputs:
       test:
@@ -20,6 +20,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
