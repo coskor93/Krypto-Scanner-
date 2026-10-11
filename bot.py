@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -12,10 +13,11 @@ import yfinance as yf
 # ---------- Einstellungen ----------
 EXTRA_STOCKS = ["SAP.DE", "SIE.DE", "ALV.DE", "RHM.DE"]   # zusätzlich zum S&P 500
 CRYPTO_TOP_N = 50    # Top-N Kryptos nach Marktkapitalisierung (CoinGecko)
+BITVAVO = "https://api.bitvavo.com/v2"   # Krypto-Kurse direkt von Bitvavo (EUR-Märkte)
+SHORTS_STOCKS = True   # True = bei Aktien auch SHORT-Signale senden
+SHORTS_CRYPTO = True    # True = bei Krypto auch SHORT-/Verkaufs-Signale senden
 MAX_SIGNALS = 10     # maximal so viele Nachrichten pro Lauf (beste Scores zuerst)
 FALLBACK_STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "AMD", "NFLX", "AVGO"]
-FALLBACK_CRYPTO = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD",
-                   "ADA-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "LTC-USD", "TRX-USD"]
 INTERVAL = "1h"      # Kerzen: 15m, 30m, 1h, 1d
 PERIOD = "60d"       # genug Historie für EMA200
 MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
@@ -113,29 +115,71 @@ def get_sp500():
 
 
 STABLE = {"USDT", "USDC", "DAI", "USDE", "FDUSD", "TUSD", "USDS", "PYUSD", "USD1", "USDD", "BUIDL", "USDTB"}
-YAHOO_FIX = {"PEPE": "PEPE24478", "SUI": "SUI20947", "UNI": "UNI7083", "TAO": "TAO22974", "HYPE": "HYPE32196"}
 
 
 def get_top_crypto():
+    """Top-N Coins (CoinGecko-Rang), die bei Bitvavo gegen EUR handelbar sind."""
+    try:
+        m = requests.get(f"{BITVAVO}/markets", timeout=30)
+        m.raise_for_status()
+        avail = {x["base"] for x in m.json()
+                 if x.get("quote") == "EUR" and x.get("status") == "trading"}
+    except Exception as e:
+        print("Bitvavo-Marktliste nicht ladbar:", e)
+        return []
+
+    ranked = []
     try:
         r = requests.get("https://api.coingecko.com/api/v3/coins/markets",
                          params={"vs_currency": "usd", "order": "market_cap_desc",
-                                 "per_page": 100, "page": 1}, timeout=30)
+                                 "per_page": 150, "page": 1}, timeout=30)
         r.raise_for_status()
-        out = []
         for c in r.json():
             sym, name = c["symbol"].upper(), c["name"].lower()
             if sym in STABLE or any(w in name for w in ("wrapped", "staked", "bridged", "usd", "stable")):
                 continue
-            out.append(f"{YAHOO_FIX.get(sym, sym)}-USD")
-
-            if len(out) >= CRYPTO_TOP_N:
-                break
-        print(f"Krypto: {len(out)} Symbole geladen")
-        return out
+            if sym in avail:
+                ranked.append(sym)
     except Exception as e:
-        print("Krypto-Liste nicht ladbar, nutze Fallback:", e)
-        return FALLBACK_CRYPTO
+        print("CoinGecko nicht ladbar, nutze Bitvavo-Handelsvolumen:", e)
+
+    if not ranked:
+        try:
+            t = requests.get(f"{BITVAVO}/ticker/24h", timeout=30).json()
+            t = [x for x in t if x["market"].endswith("-EUR")
+                 and x["market"][:-4] in avail and x["market"][:-4] not in STABLE]
+            t.sort(key=lambda x: float(x.get("volumeQuote") or 0), reverse=True)
+            ranked = [x["market"][:-4] for x in t]
+        except Exception as e:
+            print("Bitvavo-Ticker nicht ladbar:", e)
+
+    out = [f"{s}-EUR" for s in ranked[:CRYPTO_TOP_N]]
+    print(f"Krypto: {len(out)} Bitvavo-Märkte geladen")
+    return out
+
+
+def fetch_bitvavo(markets):
+    """Holt 1h-Kerzen direkt von Bitvavo (öffentliche API, kein Key nötig)."""
+    out = {}
+    for mk in markets:
+        try:
+            params = {"interval": INTERVAL, "limit": 500}
+            r = requests.get(f"{BITVAVO}/{mk}/candles", params=params, timeout=20)
+            if r.status_code == 429:
+                time.sleep(15)
+                r = requests.get(f"{BITVAVO}/{mk}/candles", params=params, timeout=20)
+            r.raise_for_status()
+            rows = r.json()
+            if not rows:
+                continue
+            df = pd.DataFrame([row[:6] for row in rows],
+                              columns=["ts", "Open", "High", "Low", "Close", "Volume"])
+            df["ts"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+            out[mk] = df.set_index("ts").astype(float).sort_index()
+        except Exception as e:
+            print(mk, "Fehler:", e)
+        time.sleep(0.1)
+    return out
 
 
 def download(symbols, chunk_size=50):
@@ -176,13 +220,16 @@ def send(text):
 
 def fmt(sym, sig):
     icon = "🟢" if sig["side"] == "LONG" else "🔴"
-    kind = "Krypto" if sym.endswith("-USD") else "Aktie"
-    d = 4 if sig["price"] < 10 else 2
+    crypto = sym.endswith("-EUR")
+    kind = "Krypto (Bitvavo)" if crypto else "Aktie"
+    cur = "€" if sym.endswith(("-EUR", ".DE")) else "$"
+    p = sig["price"]
+    d = 2 if p >= 10 else 4 if p >= 0.1 else 6
     return (f"{icon} {sig['side']}-Signal: {sym} ({kind}, {INTERVAL})\n"
             f"Score: {sig['score']}\n"
-            f"Preis: {sig['price']:.{d}f}\n"
-            f"Stop-Loss: {sig['stop']:.{d}f}\n"
-            f"Ziel: {sig['target']:.{d}f}\n\n"
+            f"Preis: {p:.{d}f} {cur}\n"
+            f"Stop-Loss: {sig['stop']:.{d}f} {cur}\n"
+            f"Ziel: {sig['target']:.{d}f} {cur}\n\n"
             + "\n".join("• " + w for w in sig["why"])
             + "\n\n⚠️ Keine Anlageberatung.")
 
@@ -197,7 +244,7 @@ def main():
     crypto = get_top_crypto()
     data = {}
     data.update(download(stocks))
-    data.update(download(crypto))
+    data.update(fetch_bitvavo(crypto))
     print(f"Daten für {len(data)} von {len(stocks) + len(crypto)} Symbolen erhalten")
 
     found = []
@@ -207,6 +254,9 @@ def main():
         except Exception as e:
             print(sym, "Fehler:", e); continue
         if not sig:
+            continue
+        is_crypto = sym.endswith("-EUR")
+        if sig["side"] == "SHORT" and not (SHORTS_CRYPTO if is_crypto else SHORTS_STOCKS):
             continue
         if state.get(sym) == f"{sig['side']}@{sig['candle']}":
             continue
