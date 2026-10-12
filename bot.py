@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -26,6 +27,13 @@ MIN_SCORE = 3        # Mindestpunktzahl für ein Signal
 ATR_STOP = 1.5       # Stop-Loss = 1.5 x ATR
 ATR_TARGET = 3.0     # Ziel = 3 x ATR (CRV 1:2)
 STATE_FILE = Path("state.json")
+# --- Signal-Auswertung (Erfolgskontrolle) ---
+LOG_FILE = Path("signals_log.json")
+REPORT_HOUR_UTC = 18     # täglicher Bericht ab dieser Uhrzeit (UTC; 18 = 20 Uhr Sommerzeit / 19 Uhr Winterzeit)
+NOTIFY_CLOSED = False    # True = jedes abgeschlossene Signal sofort melden (viele Nachrichten)
+FEE_STOCK = 0.001        # angenommene Gebühr+Spread pro Order (Aktien)
+FEE_CRYPTO = 0.0025      # angenommene Gebühr pro Order (Krypto)
+MAX_HOLD = {"15m": 64, "30m": 56, "1h": 48, "4h": 30, "1d": 20}   # nach so vielen Kerzen gilt ein Signal als beendet
 # --- Preisstruktur-Filter ---
 USE_SR = True          # Unterstützung/Widerstand berücksichtigen
 SR_LOOKBACK = 50       # Hoch/Tief der letzten 50 Kerzen = Widerstand/Unterstützung
@@ -325,11 +333,107 @@ def fmt(sym, sig, tf):
             + "\n\n⚠️ Keine Anlageberatung.")
 
 
+def load_log():
+    try:
+        log = json.loads(LOG_FILE.read_text()) if LOG_FILE.exists() else {}
+    except Exception:
+        log = {}
+    log.setdefault("open", [])
+    log.setdefault("closed", [])
+    log.setdefault("last_report", "")
+    return log
+
+
+def update_open(log, cache):
+    """Prüft offene Signale gegen neue Kerzen: Ziel, Stop oder Zeitlimit. Gibt neu abgeschlossene zurück."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="minutes")
+    still, done = [], []
+    for sg in log["open"]:
+        kind = "crypto" if sg["sym"].endswith("-EUR") else "stocks"
+        df = cache.get((kind, sg["tf"]), {}).get(sg["sym"])
+        if df is None or len(df) < 3:
+            still.append(sg); continue
+        df = df.iloc[:-1]                                   # nur abgeschlossene Kerzen
+        idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index
+        ts = pd.Timestamp(sg["candle"])
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+        after = df[idx > ts]
+        hold = MAX_HOLD.get(sg["tf"], 48)
+        long = sg["side"] == "LONG"
+        res = None
+        for hi, lo in zip(after["High"].values[:hold], after["Low"].values[:hold]):
+            if long:
+                if lo <= sg["stop"]:
+                    res = ("stop", sg["stop"]); break         # bei beidem in einer Kerze: Stop zuerst
+                if hi >= sg["target"]:
+                    res = ("ziel", sg["target"]); break
+            else:
+                if hi >= sg["stop"]:
+                    res = ("stop", sg["stop"]); break
+                if lo <= sg["target"]:
+                    res = ("ziel", sg["target"]); break
+        if res is None and len(after) >= hold:
+            res = ("zeit", float(after["Close"].values[hold - 1]))
+        if res is None:
+            still.append(sg); continue
+        reason, exit_px = res
+        fee = FEE_CRYPTO if sg["sym"].endswith("-EUR") else FEE_STOCK
+        gross = (exit_px - sg["entry"]) / sg["entry"] * (1 if long else -1)
+        net = gross - 2 * fee
+        done.append({**sg, "reason": reason, "exit": float(exit_px), "net": net,
+                     "r": net / sg["risk"] if sg.get("risk") else 0.0, "closed_at": now_iso})
+    log["open"] = still
+    log["closed"] = (log["closed"] + done)[-5000:]
+    return done
+
+
+def stats_line(label, items):
+    n = len(items)
+    if n == 0:
+        return f"{label}: keine"
+    z = sum(1 for x in items if x["reason"] == "ziel")
+    st = sum(1 for x in items if x["reason"] == "stop")
+    wins = sum(1 for x in items if x["net"] > 0)
+    avg_net = 100 * sum(x["net"] for x in items) / n
+    avg_r = sum(x["r"] for x in items) / n
+    warn = " ⚠️" if n < 30 else ""
+    return (f"{label}: {n} | Ziel {z} / Stop {st} / Zeit {n - z - st} | "
+            f"im Plus {100 * wins / n:.0f}% | Ø {avg_net:+.2f}% | Ø {avg_r:+.2f}R{warn}")
+
+
+def build_report(log):
+    closed, opn = log["closed"], log["open"]
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="minutes")
+    lines = [f"📈 Signal-Auswertung ({datetime.now(timezone.utc):%d.%m.%Y})",
+             f"Offen: {len(opn)} | Abgeschlossen: {len(closed)}", "",
+             stats_line("Gesamt", closed),
+             stats_line("Letzte 7 Tage", [x for x in closed if x["closed_at"] >= week_ago]), "",
+             "Nach Gruppe:"]
+    groups = {}
+    for x in closed:
+        cls = "Krypto" if x["sym"].endswith("-EUR") else "Aktien"
+        groups.setdefault((cls, x["tf"], x["side"]), []).append(x)
+    for key in sorted(groups):
+        lines.append(stats_line(" ".join(key), groups[key]))
+    lines += ["", "Nach Score:",
+              stats_line("Score 3", [x for x in closed if x["score"] == 3]),
+              stats_line("Score ≥4", [x for x in closed if x["score"] >= 4]), "",
+              f"⚠️ = unter 30 Signale, kaum aussagekräftig. Ergebnisse nach geschätzten Gebühren "
+              f"({FEE_STOCK * 100:.2f} % Aktien / {FEE_CRYPTO * 100:.2f} % Krypto pro Order). "
+              f"Ø R = Ergebnis in Vielfachen des Risikos (über 0 = profitabel). Keine Anlageberatung."]
+    return "\n".join(lines)[:3900]
+
+
 def main():
     if os.environ.get("TEST_MESSAGE"):
         send("✅ Signalbot läuft und ist mit Telegram verbunden.")
         return
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    log = load_log()
+
+    if os.environ.get("REPORT_NOW"):
+        send(build_report(log))
+        return
 
     stocks = list(dict.fromkeys(get_sp500() + EXTRA_STOCKS))
     crypto = get_top_crypto()
@@ -383,13 +487,32 @@ def main():
                 continue
             found.append((sym, tf, sig))
 
+    for c in update_open(log, cache):
+        print("Signal beendet:", c["sym"], c["tf"], c["side"], c["reason"], f"{100 * c['net']:+.2f}%")
+        if NOTIFY_CLOSED:
+            send(f"{'✅' if c['net'] > 0 else '❌'} {c['sym']} {c['tf']} {c['side']} beendet: {c['reason']} ({100 * c['net']:+.2f}% nach Gebühren)")
+
     found.sort(key=lambda x: x[2]["score"], reverse=True)
     print(f"{len(found)} neue Signale, sende die besten {min(len(found), MAX_SIGNALS)}")
     for sym, tf, sig in found[:MAX_SIGNALS]:
         send(fmt(sym, sig, tf))
         state[f"{sym}|{tf}"] = f"{sig['side']}@{sig['candle']}"
         print("Signal:", sym, tf, sig["side"], sig["score"])
+        sid = f"{sym}|{tf}|{sig['side']}|{sig['candle']}"
+        if not any(x.get("id") == sid for x in log["open"] + log["closed"]):
+            log["open"].append({"id": sid, "sym": sym, "tf": tf, "side": sig["side"], "score": sig["score"],
+                                "entry": sig["price"], "stop": sig["stop"], "target": sig["target"],
+                                "risk": abs(sig["price"] - sig["stop"]) / sig["price"],
+                                "candle": sig["candle"],
+                                "sent_at": datetime.now(timezone.utc).isoformat(timespec="minutes")})
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if datetime.now(timezone.utc).hour >= REPORT_HOUR_UTC and log["last_report"] != today:
+        send(build_report(log))
+        log["last_report"] = today
+
     STATE_FILE.write_text(json.dumps(state, indent=1))
+    LOG_FILE.write_text(json.dumps(log, indent=1))
 
 
 if __name__ == "__main__":
