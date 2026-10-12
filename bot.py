@@ -32,6 +32,13 @@ SR_LOOKBACK = 50       # Hoch/Tief der letzten 50 Kerzen = Widerstand/Unterstüt
 SR_NEAR_ATR = 1.0      # "nah" = innerhalb von 1 x ATR
 USE_CANDLES = True     # Kerzenmuster (Hammer, Shooting Star, Engulfing) als Zusatzpunkt
 BTC_FILTER = True      # Krypto-LONGs nur, wenn Bitcoin nicht im Abwärtstrend ist
+# --- Trend-Filter ---
+HTF_FILTER = True      # Signale nur in Richtung des Trends der nächsthöheren Zeitebene
+HTF_STOCK = {"15m": "1h", "30m": "1h", "1h": "1d"}                # Aktien: Signal-Ebene -> höhere Ebene
+HTF_CRYPTO = {"15m": "1h", "30m": "1h", "1h": "4h", "4h": "1d"}   # Krypto
+USE_ADX = True         # ADX: Trendstärke
+ADX_MIN = 20           # darunter = Seitwärtsphase: reine Trend-Signale (MACD/Bollinger) werden verworfen
+ADX_STRONG = 25        # ab hier +1 Punkt für Trend-Signale
 # -----------------------------------
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -63,6 +70,15 @@ def add_indicators(df):
     df["res"] = df["High"].shift(1).rolling(SR_LOOKBACK).max()
     df["sup"] = df["Low"].shift(1).rolling(SR_LOOKBACK).min()
 
+    # ADX (Trendstärke, Wilder)
+    up_move, down_move = df["High"].diff(), -df["Low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / df["atr"]
+    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / df["atr"]
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    df["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
     # Kerzenmuster
     o, h, l = df["Open"], df["High"], df["Low"]
     body, rng = (c - o).abs(), h - l
@@ -91,7 +107,7 @@ def signal_from_rows(r, p, candle):
     for side in ("LONG", "SHORT"):
         long = side == "LONG"
         score, why = 0, []
-        trigger = False
+        trigger = trend_trig = rsi_trig = False
 
         if long and r.Close > r.ema200 and r.ema50 > r.ema200:
             score += 1; why.append("Aufwärtstrend (Kurs & EMA50 > EMA200)")
@@ -99,19 +115,19 @@ def signal_from_rows(r, p, candle):
             score += 1; why.append("Abwärtstrend (Kurs & EMA50 < EMA200)")
 
         if long and p.macd_h <= 0 < r.macd_h:
-            score += 2; trigger = True; why.append("MACD bullisches Kreuz")
+            score += 2; trigger = trend_trig = True; why.append("MACD bullisches Kreuz")
         if not long and p.macd_h >= 0 > r.macd_h:
-            score += 2; trigger = True; why.append("MACD bärisches Kreuz")
+            score += 2; trigger = trend_trig = True; why.append("MACD bärisches Kreuz")
 
         if long and p.rsi < 30 <= r.rsi:
-            score += 2; trigger = True; why.append(f"RSI dreht aus überverkauft ({r.rsi:.0f})")
+            score += 2; trigger = rsi_trig = True; why.append(f"RSI dreht aus überverkauft ({r.rsi:.0f})")
         if not long and p.rsi > 70 >= r.rsi:
-            score += 2; trigger = True; why.append(f"RSI dreht aus überkauft ({r.rsi:.0f})")
+            score += 2; trigger = rsi_trig = True; why.append(f"RSI dreht aus überkauft ({r.rsi:.0f})")
 
         if long and r.Close > r.bb_up and p.Close <= p.bb_up:
-            score += 2; trigger = True; why.append("Ausbruch über oberes Bollinger-Band")
+            score += 2; trigger = trend_trig = True; why.append("Ausbruch über oberes Bollinger-Band")
         if not long and r.Close < r.bb_lo and p.Close >= p.bb_lo:
-            score += 2; trigger = True; why.append("Bruch des unteren Bollinger-Bands")
+            score += 2; trigger = trend_trig = True; why.append("Bruch des unteren Bollinger-Bands")
 
         if vol_ok and trigger:
             score += 1; why.append(f"Volumen {r.vol_ratio:.1f}x über Schnitt")
@@ -119,6 +135,12 @@ def signal_from_rows(r, p, candle):
         if not trigger:
             continue
         price, atr = float(r.Close), float(r.atr)
+
+        if USE_ADX and pd.notna(r.adx):
+            if r.adx < ADX_MIN and not rsi_trig:
+                continue                              # Seitwärtsphase: Trend-Signale unzuverlässig
+            if r.adx >= ADX_STRONG and trend_trig:
+                score += 1; why.append(f"Starker Trend (ADX {r.adx:.0f})")
 
         if USE_SR and pd.notna(r.res) and pd.notna(r.sup) and atr > 0:
             near = SR_NEAR_ATR * atr
@@ -259,6 +281,20 @@ def download(symbols, interval, chunk_size=50, period=None):
     return out
 
 
+def trend_map(data):
+    """Trend je Symbol auf einer Zeitebene: Schlusskurs der letzten abgeschlossenen Kerze über/unter EMA50."""
+    out = {}
+    for sym, df in data.items():
+        try:
+            if len(df) < 60:
+                continue
+            c = df["Close"]
+            out[sym] = "up" if c.iloc[-2] > ema(c, 50).iloc[-2] else "down"
+        except Exception:
+            continue
+    return out
+
+
 def send(text):
     if not TOKEN or not CHAT_ID:
         print("[Kein Telegram-Token gesetzt] " + text)
@@ -300,10 +336,22 @@ def main():
 
     found = []
     jobs = [(tf, "stocks") for tf in STOCK_TF] + [(tf, "crypto") for tf in CRYPTO_TF]
+    cache = {}
+
+    def get_data(kind, tf):
+        if (kind, tf) not in cache:
+            cache[(kind, tf)] = download(stocks, tf) if kind == "stocks" else fetch_bitvavo(crypto, tf)
+        return cache[(kind, tf)]
+
     for tf, kind in jobs:
-        data = download(stocks, tf) if kind == "stocks" else fetch_bitvavo(crypto, tf)
+        data = get_data(kind, tf)
         total = len(stocks) if kind == "stocks" else len(crypto)
         print(f"[{kind} {tf}] Daten für {len(data)} von {total} Symbolen erhalten")
+
+        htf_tf = (HTF_STOCK if kind == "stocks" else HTF_CRYPTO).get(tf) if HTF_FILTER else None
+        htf = trend_map(get_data(kind, htf_tf)) if htf_tf else {}
+        if htf_tf:
+            print(f"  Trendfilter {htf_tf}: {len(htf)} Symbole")
 
         btc_down = False
         if kind == "crypto" and BTC_FILTER and "BTC-EUR" in data:
@@ -326,6 +374,11 @@ def main():
                 continue
             if btc_down and sig["side"] == "LONG" and sym != "BTC-EUR":
                 continue
+            t = htf.get(sym)
+            if t:
+                if (sig["side"] == "LONG") != (t == "up"):
+                    continue                          # gegen den höheren Trend
+                sig["why"].append(f"Höherer Trend ({htf_tf}): {'aufwärts' if t == 'up' else 'abwärts'}")
             if state.get(f"{sym}|{tf}") == f"{sig['side']}@{sig['candle']}":
                 continue
             found.append((sym, tf, sig))
