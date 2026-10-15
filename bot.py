@@ -344,10 +344,53 @@ def load_log():
     return log
 
 
+VARIANTS = ["base", "2/4", "3/6", "mirror"]
+EXTRA_VARIANTS = {"2/4": (2.0, 4.0), "3/6": (3.0, 6.0)}   # (Stop, Ziel) in ATR
+
+
+def variant_levels(sg, name):
+    """Gibt (long?, Stop, Ziel) für eine Auswertungs-Variante zurück."""
+    e, long = sg["entry"], sg["side"] == "LONG"
+    atr = sg.get("atr") or abs(e - sg["stop"]) / ATR_STOP
+    if name == "base":
+        return long, sg["stop"], sg["target"]
+    if name == "mirror":                      # gleiche Abstände, aber Gegenrichtung
+        return (not long), 2 * e - sg["stop"], 2 * e - sg["target"]
+    ks, kt = EXTRA_VARIANTS[name]
+    sign = 1 if long else -1
+    return long, e - sign * ks * atr, e + sign * kt * atr
+
+
+def resolve(after, long, stop, target, hold):
+    """Spielt die Kerzen nach dem Signal durch. Gibt (Grund, Ausstiegskurs) oder None zurück."""
+    for hi, lo in zip(after["High"].values[:hold], after["Low"].values[:hold]):
+        if long:
+            if lo <= stop:
+                return "stop", stop              # bei beidem in einer Kerze: Stop zuerst
+            if hi >= target:
+                return "ziel", target
+        else:
+            if hi >= stop:
+                return "stop", stop
+            if lo <= target:
+                return "ziel", target
+    if len(after) >= hold:
+        return "zeit", float(after["Close"].values[hold - 1])
+    return None
+
+
+def res_of(sg, name="base"):
+    if "res" in sg and sg["res"]:
+        return sg["res"].get(name)
+    if name == "base" and "reason" in sg:         # alte Einträge ohne Varianten
+        return {"reason": sg["reason"], "exit": sg["exit"], "net": sg["net"], "r": sg["r"]}
+    return None
+
+
 def update_open(log, cache):
-    """Prüft offene Signale gegen neue Kerzen: Ziel, Stop oder Zeitlimit. Gibt neu abgeschlossene zurück."""
+    """Prüft offene Signale gegen neue Kerzen (alle Varianten). Gibt Signale zurück, deren Basis-Variante neu beendet wurde."""
     now_iso = datetime.now(timezone.utc).isoformat(timespec="minutes")
-    still, done = [], []
+    still, done, newly = [], [], []
     for sg in log["open"]:
         kind = "crypto" if sg["sym"].endswith("-EUR") else "stocks"
         df = cache.get((kind, sg["tf"]), {}).get(sg["sym"])
@@ -359,32 +402,41 @@ def update_open(log, cache):
         ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
         after = df[idx > ts]
         hold = MAX_HOLD.get(sg["tf"], 48)
-        long = sg["side"] == "LONG"
-        res = None
-        for hi, lo in zip(after["High"].values[:hold], after["Low"].values[:hold]):
-            if long:
-                if lo <= sg["stop"]:
-                    res = ("stop", sg["stop"]); break         # bei beidem in einer Kerze: Stop zuerst
-                if hi >= sg["target"]:
-                    res = ("ziel", sg["target"]); break
-            else:
-                if hi >= sg["stop"]:
-                    res = ("stop", sg["stop"]); break
-                if lo <= sg["target"]:
-                    res = ("ziel", sg["target"]); break
-        if res is None and len(after) >= hold:
-            res = ("zeit", float(after["Close"].values[hold - 1]))
-        if res is None:
-            still.append(sg); continue
-        reason, exit_px = res
         fee = FEE_CRYPTO if sg["sym"].endswith("-EUR") else FEE_STOCK
-        gross = (exit_px - sg["entry"]) / sg["entry"] * (1 if long else -1)
-        net = gross - 2 * fee
-        done.append({**sg, "reason": reason, "exit": float(exit_px), "net": net,
-                     "r": net / sg["risk"] if sg.get("risk") else 0.0, "closed_at": now_iso})
+        res = sg.setdefault("res", {})
+        had_base = "base" in res
+        for name in VARIANTS:
+            if name in res:
+                continue
+            long, stop, target = variant_levels(sg, name)
+            out = resolve(after, long, stop, target, hold)
+            if out is None:
+                continue
+            reason, px = out
+            e = sg["entry"]
+            net = (px - e) / e * (1 if long else -1) - 2 * fee
+            risk = abs(e - stop) / e
+            res[name] = {"reason": reason, "exit": float(px), "net": net,
+                         "r": net / risk if risk > 0 else 0.0, "t": now_iso}
+        if "base" in res and not had_base:
+            newly.append(sg)
+        if len(res) == len(VARIANTS):
+            sg["closed_at"] = now_iso
+            done.append(sg)
+        else:
+            still.append(sg)
     log["open"] = still
     log["closed"] = (log["closed"] + done)[-5000:]
-    return done
+    return newly
+
+
+def flat(sg, name="base"):
+    r = res_of(sg, name)
+    if r is None:
+        return None
+    return {"sym": sg["sym"], "tf": sg["tf"], "side": sg["side"], "score": sg["score"],
+            "reason": r["reason"], "net": r["net"], "r": r["r"],
+            "closed_at": r.get("t") or sg.get("closed_at", "")}
 
 
 def stats_line(label, items):
@@ -402,26 +454,56 @@ def stats_line(label, items):
 
 
 def build_report(log):
-    closed, opn = log["closed"], log["open"]
+    allsig = log["closed"] + log["open"]
+    items = [x for x in (flat(sg) for sg in allsig) if x]
+    n_open = sum(1 for sg in allsig if res_of(sg) is None)
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="minutes")
     lines = [f"📈 Signal-Auswertung ({datetime.now(timezone.utc):%d.%m.%Y})",
-             f"Offen: {len(opn)} | Abgeschlossen: {len(closed)}", "",
-             stats_line("Gesamt", closed),
-             stats_line("Letzte 7 Tage", [x for x in closed if x["closed_at"] >= week_ago]), "",
+             f"Abgeschlossen: {len(items)} | Noch offen: {n_open}", "",
+             stats_line("Gesamt", items),
+             stats_line("Letzte 7 Tage", [x for x in items if x["closed_at"] >= week_ago]), "",
              "Nach Gruppe:"]
     groups = {}
-    for x in closed:
+    for x in items:
         cls = "Krypto" if x["sym"].endswith("-EUR") else "Aktien"
         groups.setdefault((cls, x["tf"], x["side"]), []).append(x)
     for key in sorted(groups):
         lines.append(stats_line(" ".join(key), groups[key]))
     lines += ["", "Nach Score:",
-              stats_line("Score 3", [x for x in closed if x["score"] == 3]),
-              stats_line("Score ≥4", [x for x in closed if x["score"] >= 4]), "",
-              f"⚠️ = unter 30 Signale, kaum aussagekräftig. Ergebnisse nach geschätzten Gebühren "
+              stats_line("Score 3", [x for x in items if x["score"] == 3]),
+              stats_line("Score ≥4", [x for x in items if x["score"] >= 4]), ""]
+
+    # Varianten-Vergleich: nur Signale, bei denen ALLE Varianten beendet sind (gleiche Basis)
+    full = [sg for sg in allsig if sg.get("res") and all(v in sg["res"] for v in VARIANTS)]
+    names = {"base": f"Basis (Stop {ATR_STOP:g} / Ziel {ATR_TARGET:g} ATR)", "2/4": "Weiter (Stop 2 / Ziel 4 ATR)",
+             "3/6": "Sehr weit (Stop 3 / Ziel 6 ATR)", "mirror": "Spiegel (Gegenrichtung)"}
+    lines.append(f"Varianten-Vergleich ({len(full)} Signale, alle Varianten beendet):")
+    if not full:
+        lines.append("noch keine")
+    for title, flt in (("Alle", lambda sg: True), ("Aktien", lambda sg: not sg["sym"].endswith("-EUR")),
+                       ("Krypto", lambda sg: sg["sym"].endswith("-EUR"))):
+        sub = [sg for sg in full if flt(sg)]
+        if not sub:
+            continue
+        lines.append(f"-- {title} ({len(sub)}) --")
+        for v in VARIANTS:
+            lines.append(stats_line(names[v], [flat(sg, v) for sg in sub]))
+    lines += ["", f"⚠️ = unter 30 Signale, kaum aussagekräftig. Ergebnisse nach geschätzten Gebühren "
               f"({FEE_STOCK * 100:.2f} % Aktien / {FEE_CRYPTO * 100:.2f} % Krypto pro Order). "
-              f"Ø R = Ergebnis in Vielfachen des Risikos (über 0 = profitabel). Keine Anlageberatung."]
-    return "\n".join(lines)[:3900]
+              f"Ø R = Ergebnis in Vielfachen des Risikos (über 0 = profitabel). "
+              f"Spiegel = dieselben Signale in Gegenrichtung: ähnlich schlecht wie die Basis heißt, "
+              f"die Signalrichtung hat keinen Vorteil. Varianten gibt es nur für Signale, die beim Einbau noch offen waren oder danach kamen. Keine Anlageberatung."]
+    return "\n".join(lines)
+
+
+def send_chunks(text):
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 3500:
+            send(chunk); chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        send(chunk)
 
 
 def main():
@@ -432,7 +514,7 @@ def main():
     log = load_log()
 
     if os.environ.get("REPORT_NOW"):
-        send(build_report(log))
+        send_chunks(build_report(log))
         return
 
     stocks = list(dict.fromkeys(get_sp500() + EXTRA_STOCKS))
@@ -488,9 +570,10 @@ def main():
             found.append((sym, tf, sig))
 
     for c in update_open(log, cache):
-        print("Signal beendet:", c["sym"], c["tf"], c["side"], c["reason"], f"{100 * c['net']:+.2f}%")
+        b = c["res"]["base"]
+        print("Signal beendet:", c["sym"], c["tf"], c["side"], b["reason"], f"{100 * b['net']:+.2f}%")
         if NOTIFY_CLOSED:
-            send(f"{'✅' if c['net'] > 0 else '❌'} {c['sym']} {c['tf']} {c['side']} beendet: {c['reason']} ({100 * c['net']:+.2f}% nach Gebühren)")
+            send(f"{'✅' if b['net'] > 0 else '❌'} {c['sym']} {c['tf']} {c['side']} beendet: {b['reason']} ({100 * b['net']:+.2f}% nach Gebühren)")
 
     found.sort(key=lambda x: x[2]["score"], reverse=True)
     print(f"{len(found)} neue Signale, sende die besten {min(len(found), MAX_SIGNALS)}")
@@ -503,16 +586,17 @@ def main():
             log["open"].append({"id": sid, "sym": sym, "tf": tf, "side": sig["side"], "score": sig["score"],
                                 "entry": sig["price"], "stop": sig["stop"], "target": sig["target"],
                                 "risk": abs(sig["price"] - sig["stop"]) / sig["price"],
+                                "atr": abs(sig["price"] - sig["stop"]) / ATR_STOP, "res": {},
                                 "candle": sig["candle"],
                                 "sent_at": datetime.now(timezone.utc).isoformat(timespec="minutes")})
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if datetime.now(timezone.utc).hour >= REPORT_HOUR_UTC and log["last_report"] != today:
-        send(build_report(log))
+        send_chunks(build_report(log))
         log["last_report"] = today
 
     STATE_FILE.write_text(json.dumps(state, indent=1))
-    LOG_FILE.write_text(json.dumps(log, indent=1))
+    LOG_FILE.write_text(json.dumps(log, separators=(",", ":")))
 
 
 if __name__ == "__main__":
