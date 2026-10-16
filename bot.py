@@ -420,9 +420,14 @@ def update_open(log, cache):
                          "r": net / risk if risk > 0 else 0.0, "t": now_iso}
         if "base" in res and not had_base:
             newly.append(sg)
-        if len(res) == len(VARIANTS):
+        aged = len(after) >= hold          # Zeitlimit abgelaufen: dann sind garantiert alle Varianten beendet
+        if len(res) == len(VARIANTS) and aged:
             sg["closed_at"] = now_iso
+            sg["aged"] = True
             done.append(sg)
+        elif datetime.now(timezone.utc) - datetime.fromisoformat(sg["sent_at"].replace("Z", "+00:00")).replace(
+                tzinfo=timezone.utc) > timedelta(days=60) if sg.get("sent_at", "").startswith("20") else False:
+            continue                       # Altlast ohne Daten nach 60 Tagen verwerfen
         else:
             still.append(sg)
     log["open"] = still
@@ -474,10 +479,11 @@ def build_report(log):
               stats_line("Score ≥4", [x for x in items if x["score"] >= 4]), ""]
 
     # Varianten-Vergleich: nur Signale, bei denen ALLE Varianten beendet sind (gleiche Basis)
-    full = [sg for sg in allsig if sg.get("res") and all(v in sg["res"] for v in VARIANTS)]
+    # nur Signale, deren Zeitlimit abgelaufen ist (sonst sind schnelle Ausreißer überrepräsentiert)
+    full = [sg for sg in log["closed"] if sg.get("aged") and sg.get("res") and all(v in sg["res"] for v in VARIANTS)]
     names = {"base": f"Basis (Stop {ATR_STOP:g} / Ziel {ATR_TARGET:g} ATR)", "2/4": "Weiter (Stop 2 / Ziel 4 ATR)",
              "3/6": "Sehr weit (Stop 3 / Ziel 6 ATR)", "mirror": "Spiegel (Gegenrichtung)"}
-    lines.append(f"Varianten-Vergleich ({len(full)} Signale, alle Varianten beendet):")
+    lines.append(f"Varianten-Vergleich ({len(full)} Signale, Zeitlimit abgelaufen):")
     if not full:
         lines.append("noch keine")
     for title, flt in (("Alle", lambda sg: True), ("Aktien", lambda sg: not sg["sym"].endswith("-EUR")),
